@@ -27,7 +27,6 @@ def seed_travel_lessons() -> list[dict[str, object]]:
     for lesson in TRAVEL_SYNTHETIC_LESSONS:
         receipt = durable_writer.remember_durable(
             expected_item_id=lesson.item_id,
-            expected_memory_type="lesson",
             session_id=config.run_id,
             agent_id="statebench-phase1-seeder",
             item_id=lesson.item_id,

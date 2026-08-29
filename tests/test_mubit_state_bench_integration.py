@@ -286,7 +286,7 @@ def test_seed_script_writes_exactly_five_global_lessons(monkeypatch):
             "traces": [
                 {
                     "item_id": lesson.item_id,
-                    "writes": [{"memory_type": "lesson", "record_id": f"record-{index}", "success": True}],
+                    "writes": [{"memory_type": "knowledge", "record_id": f"record-{index}", "success": True}],
                 }
             ],
         }

@@ -91,7 +91,6 @@ class MubitTrajectoryLearner:
                 item_id = f"decision-turn-{turn.turn_index:03d}"
                 receipt = self._durable_writer.remember_durable(
                     expected_item_id=item_id,
-                    expected_memory_type="trace",
                     session_id=self._config.run_id,
                     agent_id="statebench-phase2-builder",
                     item_id=item_id,
@@ -210,6 +209,12 @@ def validate_raw_reflection_record(
             or any(not isinstance(value, str) or not value for value in receipt["record_ids"])
         ):
             raise ValueError(f"Raw reflection durable receipt record IDs are invalid for {source.task_id}")
+        if (
+            not isinstance(receipt.get("storage_memory_types"), list)
+            or len(receipt["storage_memory_types"]) != len(receipt["record_ids"])
+            or any(not isinstance(value, str) or not value for value in receipt["storage_memory_types"])
+        ):
+            raise ValueError(f"Raw reflection durable storage types are invalid for {source.task_id}")
         job_sha256 = receipt.get("job_sha256")
         if not isinstance(job_sha256, str) or not _SHA256.fullmatch(job_sha256):
             raise ValueError(f"Raw reflection durable receipt hash is invalid for {source.task_id}")

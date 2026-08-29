@@ -54,7 +54,7 @@ class RecordingBuildClient:
             "traces": [
                 {
                     "item_id": item_id,
-                    "writes": [{"memory_type": "trace", "record_id": f"record-{item_id}", "success": True}],
+                    "writes": [{"memory_type": "knowledge", "record_id": f"record-{item_id}", "success": True}],
                 }
             ],
         }
@@ -83,13 +83,14 @@ class RecordingDurableWriter:
         self.calls.append(("remember_durable", kwargs))
         return SimpleNamespace(
             to_dict=lambda: {
-                "schema_version": "mubit_durable_write_receipt_v1",
+                "schema_version": "mubit_durable_write_receipt_v2",
                 "item_id": kwargs["expected_item_id"],
                 "job_id": f"job-{kwargs['expected_item_id']}",
                 "status": "completed",
                 "submission_deduplicated": False,
                 "job_deduplicated": False,
                 "record_ids": [f"record-{kwargs['expected_item_id']}"],
+                "storage_memory_types": ["knowledge"],
                 "job_sha256": "d" * 64,
             }
         )
@@ -147,13 +148,14 @@ def _reflection_record(
     parsed = parse_decision_turns(source)
     receipts = [
         {
-            "schema_version": "mubit_durable_write_receipt_v1",
+            "schema_version": "mubit_durable_write_receipt_v2",
             "item_id": f"decision-turn-{turn.turn_index:03d}",
             "job_id": f"job-{turn.turn_index}",
             "status": "completed",
             "submission_deduplicated": False,
             "job_deduplicated": False,
             "record_ids": [f"record-{turn.turn_index}"],
+            "storage_memory_types": ["knowledge"],
             "job_sha256": f"{turn.turn_index % 10}" * 64,
         }
         for turn in parsed.turns
@@ -499,7 +501,7 @@ def test_durable_writer_requires_terminal_successful_expected_write():
             "traces": [
                 {
                     "item_id": "trace-1",
-                    "writes": [{"memory_type": "trace", "record_id": "record-1", "success": True}],
+                    "writes": [{"memory_type": "knowledge", "record_id": "record-1", "success": True}],
                 }
             ],
         },
@@ -508,13 +510,13 @@ def test_durable_writer_requires_terminal_successful_expected_write():
 
     receipt = writer.remember_durable(
         expected_item_id="trace-1",
-        expected_memory_type="trace",
         session_id="run-1",
         item_id="trace-1",
         content="trace",
     )
 
     assert receipt.record_ids == ("record-1",)
+    assert receipt.storage_memory_types == ("knowledge",)
     assert client.remember.call_args.kwargs["wait"] is False
     assert client.advanced.get_ingest_job.call_count == 2
 
@@ -546,7 +548,6 @@ def test_durable_writer_rejects_terminal_jobs_without_expected_durable_write(job
     with pytest.raises(IngestDurabilityError):
         writer.remember_durable(
             expected_item_id="trace-1",
-            expected_memory_type="trace",
             session_id="run-1",
             item_id="trace-1",
             content="trace",

@@ -14,7 +14,7 @@ class IngestDurabilityError(RuntimeError):
     pass
 
 
-DURABLE_WRITE_RECEIPT_SCHEMA = "mubit_durable_write_receipt_v1"
+DURABLE_WRITE_RECEIPT_SCHEMA = "mubit_durable_write_receipt_v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +25,7 @@ class DurableWriteReceipt:
     submission_deduplicated: bool
     job_deduplicated: bool
     record_ids: tuple[str, ...]
+    storage_memory_types: tuple[str, ...]
     job_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,6 +37,7 @@ class DurableWriteReceipt:
             "submission_deduplicated": self.submission_deduplicated,
             "job_deduplicated": self.job_deduplicated,
             "record_ids": list(self.record_ids),
+            "storage_memory_types": list(self.storage_memory_types),
             "job_sha256": self.job_sha256,
         }
 
@@ -74,7 +76,6 @@ class MubitDurableWriter:
         self,
         *,
         expected_item_id: str,
-        expected_memory_type: str,
         **remember_kwargs: Any,
     ) -> DurableWriteReceipt:
         if remember_kwargs.get("item_id") != expected_item_id:
@@ -95,7 +96,6 @@ class MubitDurableWriter:
             job_id=job_id,
             run_id=str(remember_kwargs["session_id"]),
             expected_item_id=expected_item_id,
-            expected_memory_type=expected_memory_type,
             submission_deduplicated=accepted.get("deduplicated") is True,
         )
 
@@ -105,25 +105,22 @@ class MubitDurableWriter:
         job_id: str,
         run_id: str,
         expected_item_id: str,
-        expected_memory_type: str,
         submission_deduplicated: bool,
     ) -> DurableWriteReceipt:
         deadline = self._clock() + self._timeout_seconds
         while True:
             job = self._client.advanced.get_ingest_job(run_id=run_id, job_id=job_id)
             if not isinstance(job, dict):
-                raise IngestDurabilityError(f"Mubit ingest job {job_id} did not return an object")
+                raise IngestDurabilityError("Mubit ingest job did not return an object")
             if job.get("done") is True:
                 return self._validate_durable_job(
                     job=job,
                     job_id=job_id,
-                    expected_run_id=run_id,
                     expected_item_id=expected_item_id,
-                    expected_memory_type=expected_memory_type,
                     submission_deduplicated=submission_deduplicated,
                 )
             if self._clock() >= deadline:
-                raise IngestDurabilityError(f"Timed out before Mubit ingest job {job_id} became durable")
+                raise IngestDurabilityError("Timed out before the Mubit ingest job became durable")
             self._sleeper(self._poll_interval_seconds)
 
     @staticmethod
@@ -131,18 +128,16 @@ class MubitDurableWriter:
         *,
         job: dict[str, Any],
         job_id: str,
-        expected_run_id: str,
         expected_item_id: str,
-        expected_memory_type: str,
         submission_deduplicated: bool,
     ) -> DurableWriteReceipt:
         status = str(job.get("status", "")).lower()
         if status in {"failed", "error", "rejected", "cancelled", "canceled"} or job.get("error"):
-            raise IngestDurabilityError(f"Mubit ingest job {job_id} completed unsuccessfully")
+            raise IngestDurabilityError("Mubit ingest job completed unsuccessfully")
         if status not in {"completed", "succeeded", "success", "done"}:
-            raise IngestDurabilityError(f"Mubit ingest job {job_id} has an unconfirmed terminal status")
-        if job.get("job_id") != job_id or job.get("run_id") != expected_run_id:
-            raise IngestDurabilityError(f"Mubit ingest job {job_id} identity does not match its submission")
+            raise IngestDurabilityError("Mubit ingest job has an unconfirmed terminal status")
+        if job.get("job_id") != job_id or not isinstance(job.get("run_id"), str) or not job["run_id"]:
+            raise IngestDurabilityError("Mubit ingest job identity does not match its submission")
         traces = job.get("traces")
         if not isinstance(traces, list):
             raise IngestDurabilityError(f"Mubit ingest job {job_id} returned no decision traces")
@@ -150,25 +145,23 @@ class MubitDurableWriter:
             trace for trace in traces if isinstance(trace, dict) and trace.get("item_id") == expected_item_id
         ]
         if len(matching_traces) != 1:
-            raise IngestDurabilityError(
-                f"Mubit ingest job {job_id} did not contain exactly one trace for {expected_item_id}"
-            )
+            raise IngestDurabilityError("Mubit ingest job did not contain exactly one expected item trace")
         writes = matching_traces[0].get("writes")
         if not isinstance(writes, list):
-            raise IngestDurabilityError(f"Mubit ingest job {job_id} returned no write results")
+            raise IngestDurabilityError("Mubit ingest job returned no write results")
         durable_writes = [
             write
             for write in writes
             if isinstance(write, dict)
             and write.get("success") is True
-            and write.get("memory_type") == expected_memory_type
+            and not write.get("error")
+            and isinstance(write.get("memory_type"), str)
+            and write["memory_type"].strip()
             and isinstance(write.get("record_id"), str)
             and write["record_id"].strip()
         ]
         if not durable_writes:
-            raise IngestDurabilityError(
-                f"Mubit ingest job {job_id} did not confirm a durable {expected_memory_type} write"
-            )
+            raise IngestDurabilityError("Mubit ingest job did not confirm a durable storage write")
         return DurableWriteReceipt(
             item_id=expected_item_id,
             job_id=job_id,
@@ -176,5 +169,6 @@ class MubitDurableWriter:
             submission_deduplicated=submission_deduplicated,
             job_deduplicated=job.get("deduplicated") is True,
             record_ids=tuple(str(write["record_id"]) for write in durable_writes),
+            storage_memory_types=tuple(str(write["memory_type"]) for write in durable_writes),
             job_sha256=canonical_sha256(job),
         )

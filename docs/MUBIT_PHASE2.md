@@ -62,7 +62,7 @@ statebench:travel:train:phase2-travel-pilot-001:<task-id>
 
 Every trace write uses a deterministic item ID, upsert key, and idempotency key.
 The client submits asynchronously, polls its exact ingest job, and requires a
-successful durable `trace` record for the expected item ID. Only after every
+successful durable storage record for the expected trace item ID. Only after every
 turn has a persisted receipt can the learner call `reflect()` exactly once.
 Configure the BUILD instance without a server-side automatic
 reflection cadence if strict one-reflection-per-task accounting is required.

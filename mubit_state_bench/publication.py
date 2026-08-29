@@ -62,7 +62,6 @@ class FrozenArtifactPublisher:
             item_id = f"frozen-lesson-{content_sha256[:24]}"
             receipt = self._durable_writer.remember_durable(
                 expected_item_id=item_id,
-                expected_memory_type="lesson",
                 session_id=self._config.run_id,
                 agent_id="statebench-phase2-publisher",
                 item_id=item_id,
