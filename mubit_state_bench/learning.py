@@ -13,7 +13,13 @@ from mubit_state_bench.config import (
     MubitStateBenchConfig,
     redact_configured_secrets,
 )
-from mubit_state_bench.durability import DURABLE_WRITE_RECEIPT_SCHEMA, MubitDurableWriter
+from mubit_state_bench.durability import (
+    DURABLE_WRITE_RECEIPT_SCHEMA,
+    LEGACY_DURABLE_WRITE_RECEIPT_SCHEMA,
+    MAX_PREACCEPT_INGEST_RETRIES,
+    IngestDurabilityError,
+    MubitDurableWriter,
+)
 from mubit_state_bench.io_utils import canonical_sha256, write_json_atomic
 from mubit_state_bench.trajectory import (
     DECISION_TURN_SCHEMA,
@@ -57,6 +63,56 @@ def _reflection_quality(response: Any) -> tuple[str, list[str]]:
     return ("degraded", reasons) if reasons else ("ok", [])
 
 
+def _validate_ingest_submission_attempts(
+    attempts: Any,
+    *,
+    task_id: str,
+    require_accepted: bool,
+) -> None:
+    if not isinstance(attempts, list) or not attempts or len(attempts) > MAX_PREACCEPT_INGEST_RETRIES + 1:
+        raise ValueError(f"Raw reflection ingest submission attempts are invalid for {task_id}")
+    request_sha256: str | None = None
+    for index, attempt in enumerate(attempts, start=1):
+        if not isinstance(attempt, dict) or attempt.get("attempt_number") != index:
+            raise ValueError(f"Raw reflection ingest submission attempt order mismatch for {task_id}")
+        attempt_sha256 = attempt.get("request_sha256")
+        if not isinstance(attempt_sha256, str) or not _SHA256.fullmatch(attempt_sha256):
+            raise ValueError(f"Raw reflection ingest submission request hash is invalid for {task_id}")
+        if request_sha256 is None:
+            request_sha256 = attempt_sha256
+        elif request_sha256 != attempt_sha256:
+            raise ValueError(f"Raw reflection ingest retries changed their request for {task_id}")
+        result = attempt.get("result")
+        if result == "accepted":
+            if index != len(attempts) or attempt.get("retry_scheduled") is not False:
+                raise ValueError(f"Raw reflection accepted ingest attempt is not terminal for {task_id}")
+            if attempt.get("error_type") is not None or attempt.get("error") is not None:
+                raise ValueError(f"Raw reflection accepted ingest attempt contains an error for {task_id}")
+        elif result == "preaccept_error":
+            if not isinstance(attempt.get("error_type"), str) or not isinstance(attempt.get("error"), str):
+                raise ValueError(f"Raw reflection ingest attempt error is invalid for {task_id}")
+            retry_scheduled = attempt.get("retry_scheduled")
+            if not isinstance(retry_scheduled, bool):
+                raise ValueError(f"Raw reflection ingest retry decision is invalid for {task_id}")
+            if retry_scheduled and (
+                attempt.get("stats_available") is not True
+                or attempt.get("remote_total_jobs") != 0
+                or attempt.get("remote_total_items") != 0
+                or attempt.get("authenticated_read_check_passed") is not True
+            ):
+                raise ValueError(f"Raw reflection unsafe ingest retry was scheduled for {task_id}")
+            if index < len(attempts) and retry_scheduled is not True:
+                raise ValueError(f"Raw reflection ingest retried without a safe retry decision for {task_id}")
+        else:
+            raise ValueError(f"Raw reflection ingest attempt result is invalid for {task_id}")
+    if require_accepted and attempts[-1].get("result") != "accepted":
+        raise ValueError(f"Raw reflection durable write lacks an accepted submission for {task_id}")
+    if not require_accepted and (
+        attempts[-1].get("result") != "preaccept_error" or attempts[-1].get("retry_scheduled") is not False
+    ):
+        raise ValueError(f"Raw reflection failed ingest attempt history is not terminal for {task_id}")
+
+
 class MubitTrajectoryLearner:
     """Write deterministic turns, then reflect with transient-service retries only."""
 
@@ -73,7 +129,7 @@ class MubitTrajectoryLearner:
         self._client = client
         self._config = config
         self._loader = loader
-        self._durable_writer = durable_writer or MubitDurableWriter(client)
+        self._durable_writer = durable_writer or MubitDurableWriter(client, enable_build_preaccept_retries=True)
 
     def _reflect_with_retries(self, parameters: dict[str, Any]) -> tuple[Any, list[dict[str, Any]]]:
         attempts: list[dict[str, Any]] = []
@@ -183,15 +239,21 @@ class MubitTrajectoryLearner:
 
             reflection, reflection_attempts = self._reflect_with_retries(reflection_parameters)
         except Exception as exc:
-            failure = exc.original if isinstance(exc, _ReflectionAttemptsFailed) else exc
+            failure = exc.original if isinstance(exc, (_ReflectionAttemptsFailed, IngestDurabilityError)) else exc
+            if failure is None:
+                failure = exc
             if isinstance(exc, _ReflectionAttemptsFailed):
                 reflection_attempts = exc.attempts
+            failed_ingest_submission_attempts = (
+                exc.submission_attempts if isinstance(exc, IngestDurabilityError) else []
+            )
             record = {
                 **base_record,
                 "status": "failed",
                 "failure_stage": "ingest" if len(durable_receipts) < len(parsed.turns) else "reflect",
                 "durable_ingested_item_count": len(durable_receipts),
                 "durable_ingest_receipts": durable_receipts,
+                "failed_ingest_submission_attempts": failed_ingest_submission_attempts,
                 "reflection_retry_schema": REFLECTION_RETRY_SCHEMA,
                 "reflection_max_retries": MAX_REFLECTION_RETRIES,
                 "reflection_parameters": reflection_parameters,
@@ -275,7 +337,8 @@ def validate_raw_reflection_record(
     ]:
         raise ValueError(f"Raw reflection durable receipt order mismatch for {source.task_id}")
     for receipt in receipts:
-        if receipt.get("schema_version") != DURABLE_WRITE_RECEIPT_SCHEMA:
+        receipt_schema = receipt.get("schema_version")
+        if receipt_schema not in {DURABLE_WRITE_RECEIPT_SCHEMA, LEGACY_DURABLE_WRITE_RECEIPT_SCHEMA}:
             raise ValueError(f"Raw reflection durable receipt schema mismatch for {source.task_id}")
         if not isinstance(receipt.get("job_id"), str) or not receipt["job_id"]:
             raise ValueError(f"Raw reflection durable receipt job ID is invalid for {source.task_id}")
@@ -298,6 +361,12 @@ def validate_raw_reflection_record(
             receipt.get("job_deduplicated"), bool
         ):
             raise ValueError(f"Raw reflection durable receipt deduplication fields are invalid for {source.task_id}")
+        if receipt_schema == DURABLE_WRITE_RECEIPT_SCHEMA:
+            _validate_ingest_submission_attempts(
+                receipt.get("submission_attempts"),
+                task_id=source.task_id,
+                require_accepted=True,
+            )
     if record.get("durable_ingested_item_count") != len(receipts):
         raise ValueError(f"Raw reflection durable item count mismatch for {source.task_id}")
 
@@ -399,3 +468,16 @@ def validate_raw_reflection_record(
                 not attempts or attempts[-1]["result"] != "error" or attempts[-1]["retry_scheduled"] is not False
             ):
                 raise ValueError(f"Raw reflection failure attempt history is invalid for {source.task_id}")
+        failed_ingest_attempts = record.get("failed_ingest_submission_attempts")
+        if failed_ingest_attempts is not None:
+            if record.get("failure_stage") != "ingest":
+                if failed_ingest_attempts:
+                    raise ValueError(
+                        f"Raw reflection reflect failure has ingest submission failures for {source.task_id}"
+                    )
+            elif failed_ingest_attempts:
+                _validate_ingest_submission_attempts(
+                    failed_ingest_attempts,
+                    task_id=source.task_id,
+                    require_accepted=failed_ingest_attempts[-1].get("result") == "accepted",
+                )

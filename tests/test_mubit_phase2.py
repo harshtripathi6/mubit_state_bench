@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from mubit.types import ServerError, TransportError
+from mubit.types import AuthError, ServerError, TransportError
 
 from mubit_state_bench.artifact import build_frozen_artifact, load_frozen_artifact
 from mubit_state_bench.build_trajectories import build_training_reflections
@@ -637,6 +637,150 @@ def test_durable_writer_rejects_terminal_jobs_without_expected_durable_write(job
             item_id="trace-1",
             content="trace",
         )
+
+
+def test_build_preaccept_failure_retries_only_after_zero_stats_and_authenticated_read():
+    client = MagicMock()
+    client.remember.side_effect = [
+        AuthError("temporary authentication failure"),
+        {"accepted": True, "job_id": "job-1", "status": "pending", "deduplicated": False},
+    ]
+    client.advanced.get_run_ingest_stats.return_value = {
+        "stats_available": True,
+        "total_jobs": 0,
+        "total_items": 0,
+    }
+    client.lessons.return_value = {"lessons": []}
+    client.advanced.get_ingest_job.return_value = {
+        "job_id": "job-1",
+        "run_id": "canonical-run-1",
+        "status": "completed",
+        "done": True,
+        "traces": [
+            {
+                "item_id": "trace-1",
+                "writes": [{"memory_type": "knowledge", "record_id": "record-1", "success": True}],
+            }
+        ],
+    }
+    writer = MubitDurableWriter(client, enable_build_preaccept_retries=True)
+    kwargs = {"session_id": "run-1", "item_id": "trace-1", "content": "identical trace", "idempotency_key": "same"}
+
+    receipt = writer.remember_durable(expected_item_id="trace-1", **kwargs)
+
+    assert client.remember.call_count == 2
+    assert client.remember.call_args_list[0].kwargs == client.remember.call_args_list[1].kwargs
+    assert client.remember.call_args_list[0].kwargs["idempotency_key"] == "same"
+    assert [attempt["result"] for attempt in receipt.submission_attempts] == ["preaccept_error", "accepted"]
+    assert receipt.submission_attempts[0]["remote_total_jobs"] == 0
+    assert receipt.submission_attempts[0]["remote_total_items"] == 0
+    assert receipt.submission_attempts[0]["authenticated_read_check_passed"] is True
+    assert receipt.submission_attempts[0]["retry_scheduled"] is True
+    assert len({attempt["request_sha256"] for attempt in receipt.submission_attempts}) == 1
+
+
+def test_build_preaccept_failure_is_not_retried_when_remote_run_is_nonempty():
+    client = MagicMock()
+    client.remember.side_effect = AuthError("submission response lost")
+    client.advanced.get_run_ingest_stats.return_value = {
+        "stats_available": True,
+        "total_jobs": 1,
+        "total_items": 1,
+    }
+    writer = MubitDurableWriter(client, enable_build_preaccept_retries=True)
+
+    with pytest.raises(IngestDurabilityError) as exc_info:
+        writer.remember_durable(
+            expected_item_id="trace-1",
+            session_id="run-1",
+            item_id="trace-1",
+            content="trace",
+            idempotency_key="same",
+        )
+
+    assert client.remember.call_count == 1
+    client.lessons.assert_not_called()
+    assert exc_info.value.submission_attempts[0]["retry_scheduled"] is False
+
+
+def test_build_preaccept_failure_is_not_retried_when_authenticated_read_fails():
+    client = MagicMock()
+    client.remember.side_effect = AuthError("credential rejected")
+    client.advanced.get_run_ingest_stats.return_value = {
+        "stats_available": True,
+        "total_jobs": 0,
+        "total_items": 0,
+    }
+    client.lessons.side_effect = AuthError("credential still rejected")
+    writer = MubitDurableWriter(client, enable_build_preaccept_retries=True)
+
+    with pytest.raises(IngestDurabilityError) as exc_info:
+        writer.remember_durable(
+            expected_item_id="trace-1",
+            session_id="run-1",
+            item_id="trace-1",
+            content="trace",
+            idempotency_key="same",
+        )
+
+    assert client.remember.call_count == 1
+    assert exc_info.value.submission_attempts[0]["authenticated_read_check_passed"] is False
+    assert exc_info.value.submission_attempts[0]["retry_scheduled"] is False
+
+
+def test_build_preaccept_failure_stops_after_two_identical_retries():
+    client = MagicMock()
+    client.remember.side_effect = [AuthError("one"), AuthError("two"), AuthError("three")]
+    client.advanced.get_run_ingest_stats.return_value = {
+        "stats_available": True,
+        "total_jobs": 0,
+        "total_items": 0,
+    }
+    client.lessons.return_value = {"lessons": []}
+    writer = MubitDurableWriter(client, enable_build_preaccept_retries=True)
+
+    with pytest.raises(IngestDurabilityError) as exc_info:
+        writer.remember_durable(
+            expected_item_id="trace-1",
+            session_id="run-1",
+            item_id="trace-1",
+            content="trace",
+            idempotency_key="same",
+        )
+
+    assert client.remember.call_count == 3
+    assert client.remember.call_args_list == [client.remember.call_args_list[0]] * 3
+    assert [attempt["retry_scheduled"] for attempt in exc_info.value.submission_attempts] == [True, True, False]
+    assert len({attempt["request_sha256"] for attempt in exc_info.value.submission_attempts}) == 1
+
+
+def test_build_record_persists_every_exhausted_preaccept_attempt(tmp_path):
+    loader = TrainTrajectoryLoader()
+    source = loader.load("travel", limit=1)[0]
+    client = MagicMock()
+    client.remember.side_effect = [AuthError("one"), AuthError("two"), AuthError("three")]
+    client.advanced.get_run_ingest_stats.return_value = {
+        "stats_available": True,
+        "total_jobs": 0,
+        "total_items": 0,
+    }
+    client.lessons.return_value = {"lessons": []}
+
+    record = MubitTrajectoryLearner(
+        client=client,
+        config=_config(MubitCredentialRole.BUILD),
+        loader=loader,
+    ).learn(source, tmp_path / "failed.json")
+
+    assert record["status"] == "failed"
+    assert record["failure_stage"] == "ingest"
+    assert record["error_type"] == "AuthError"
+    assert len(record["failed_ingest_submission_attempts"]) == 3
+    assert [attempt["retry_scheduled"] for attempt in record["failed_ingest_submission_attempts"]] == [
+        True,
+        True,
+        False,
+    ]
 
 
 def test_learner_never_reflects_after_an_ingest_durability_failure(tmp_path):

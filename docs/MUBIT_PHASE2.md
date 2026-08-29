@@ -66,6 +66,13 @@ successful durable storage record for the expected trace item ID. Only after eve
 turn has a persisted receipt can the learner begin the logical reflection operation.
 Configure the BUILD instance without a server-side automatic reflection cadence.
 
+Before an ingest submission is accepted, BUILD may retry the identical request
+and idempotency key up to twice. A retry is allowed only after run-ingest stats
+prove that the run has zero remote jobs and zero items and an authenticated
+read-only request succeeds with the current BUILD credential. Every submission
+attempt and guard result is recorded. Once a submission is accepted, this retry
+rule cannot apply.
+
 The logical reflection operation may make up to two additional attempts only
 when the SDK raises a transient Mubit server/service error. Every attempt uses
 the same already-durable evidence and identical reflection parameters, and its
