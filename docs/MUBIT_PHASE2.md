@@ -63,9 +63,14 @@ statebench:travel:train:phase2-travel-pilot-001:<task-id>
 Every trace write uses a deterministic item ID, upsert key, and idempotency key.
 The client submits asynchronously, polls its exact ingest job, and requires a
 successful durable storage record for the expected trace item ID. Only after every
-turn has a persisted receipt can the learner call `reflect()` exactly once.
-Configure the BUILD instance without a server-side automatic
-reflection cadence if strict one-reflection-per-task accounting is required.
+turn has a persisted receipt can the learner begin the logical reflection operation.
+Configure the BUILD instance without a server-side automatic reflection cadence.
+
+The logical reflection operation may make up to two additional attempts only
+when the SDK raises a transient Mubit server/service error. Every attempt uses
+the same already-durable evidence and identical reflection parameters, and its
+result is recorded in the raw reflection. Successful or degraded responses are
+terminal and are never retried; lesson content and count never affect retries.
 
 Raw results are stored under:
 

@@ -1,10 +1,12 @@
-"""Offline Mubit ingestion and one-shot reflection for training trajectories."""
+"""Offline Mubit ingestion and reliability-bounded reflection for training trajectories."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
 from typing import Any
+
+from mubit.types import ServerError, TransportError
 
 from mubit_state_bench.config import (
     MubitCredentialRole,
@@ -23,6 +25,22 @@ from mubit_state_bench.trajectory import (
 
 RAW_REFLECTION_SCHEMA = "raw_mubit_reflection_v2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+REFLECTION_RETRY_SCHEMA = "transient_mubit_reflect_retry_v1"
+MAX_REFLECTION_RETRIES = 2
+_TRANSIENT_TRANSPORT_CODES = {"UNAVAILABLE", "DEADLINE_EXCEEDED", "CONNECTION_RESET", "IO"}
+
+
+class _ReflectionAttemptsFailed(Exception):
+    def __init__(self, original: Exception, attempts: list[dict[str, Any]]):
+        super().__init__(str(original))
+        self.original = original
+        self.attempts = attempts
+
+
+def _is_transient_reflection_error(exc: Exception) -> bool:
+    if isinstance(exc, ServerError):
+        return True
+    return isinstance(exc, TransportError) and exc.code in _TRANSIENT_TRANSPORT_CODES
 
 
 def _reflection_quality(response: Any) -> tuple[str, list[str]]:
@@ -40,7 +58,7 @@ def _reflection_quality(response: Any) -> tuple[str, list[str]]:
 
 
 class MubitTrajectoryLearner:
-    """Write deterministic decision turns, then explicitly reflect once."""
+    """Write deterministic turns, then reflect with transient-service retries only."""
 
     def __init__(
         self,
@@ -56,6 +74,47 @@ class MubitTrajectoryLearner:
         self._config = config
         self._loader = loader
         self._durable_writer = durable_writer or MubitDurableWriter(client)
+
+    def _reflect_with_retries(self, parameters: dict[str, Any]) -> tuple[Any, list[dict[str, Any]]]:
+        attempts: list[dict[str, Any]] = []
+        parameters_sha256 = canonical_sha256(parameters)
+        for attempt_number in range(1, MAX_REFLECTION_RETRIES + 2):
+            try:
+                response = self._client.reflect(**parameters)
+            except Exception as exc:
+                transient = _is_transient_reflection_error(exc)
+                retry_scheduled = transient and attempt_number <= MAX_REFLECTION_RETRIES
+                attempts.append(
+                    {
+                        "attempt_number": attempt_number,
+                        "parameters_sha256": parameters_sha256,
+                        "result": "error",
+                        "transient": transient,
+                        "retry_scheduled": retry_scheduled,
+                        "error_type": type(exc).__name__,
+                        "error": redact_configured_secrets(str(exc), (self._config.api_key,)),
+                        "response_sha256": None,
+                    }
+                )
+                if retry_scheduled:
+                    continue
+                raise _ReflectionAttemptsFailed(exc, attempts) from exc
+
+            status, _ = _reflection_quality(response)
+            attempts.append(
+                {
+                    "attempt_number": attempt_number,
+                    "parameters_sha256": parameters_sha256,
+                    "result": status,
+                    "transient": False,
+                    "retry_scheduled": False,
+                    "error_type": None,
+                    "error": None,
+                    "response_sha256": canonical_sha256(response),
+                }
+            )
+            return response, attempts
+        raise AssertionError("unreachable reflection retry state")
 
     def learn(self, source: TrainTrajectorySource, output_path: Path) -> dict[str, Any]:
         self._loader.assert_train_source(source)
@@ -76,6 +135,12 @@ class MubitTrajectoryLearner:
             "parsed_turn_count": len(parsed.turns),
         }
         durable_receipts: list[dict[str, Any]] = []
+        reflection_parameters = {
+            "session_id": self._config.run_id,
+            "include_linked_runs": False,
+            "last_n_items": len(parsed.turns),
+        }
+        reflection_attempts: list[dict[str, Any]] = []
         try:
             for turn in parsed.turns:
                 content = turn.canonical_content()
@@ -116,23 +181,28 @@ class MubitTrajectoryLearner:
             if len(durable_receipts) != len(parsed.turns):
                 raise RuntimeError("Not every parsed trace has a durable Mubit write receipt")
 
-            reflection = self._client.reflect(
-                session_id=self._config.run_id,
-                include_linked_runs=False,
-                last_n_items=len(parsed.turns),
-            )
+            reflection, reflection_attempts = self._reflect_with_retries(reflection_parameters)
         except Exception as exc:
+            failure = exc.original if isinstance(exc, _ReflectionAttemptsFailed) else exc
+            if isinstance(exc, _ReflectionAttemptsFailed):
+                reflection_attempts = exc.attempts
             record = {
                 **base_record,
                 "status": "failed",
                 "failure_stage": "ingest" if len(durable_receipts) < len(parsed.turns) else "reflect",
                 "durable_ingested_item_count": len(durable_receipts),
                 "durable_ingest_receipts": durable_receipts,
+                "reflection_retry_schema": REFLECTION_RETRY_SCHEMA,
+                "reflection_max_retries": MAX_REFLECTION_RETRIES,
+                "reflection_parameters": reflection_parameters,
+                "reflection_parameters_sha256": canonical_sha256(reflection_parameters),
+                "reflection_attempt_count": len(reflection_attempts),
+                "reflection_attempts": reflection_attempts,
                 "degraded_reasons": [],
                 "raw_reflection_response": None,
                 "raw_reflection_response_sha256": None,
-                "error_type": type(exc).__name__,
-                "error": redact_configured_secrets(str(exc)),
+                "error_type": type(failure).__name__,
+                "error": redact_configured_secrets(str(failure), (self._config.api_key,)),
             }
             write_json_atomic(output_path, record)
             return record
@@ -145,6 +215,12 @@ class MubitTrajectoryLearner:
             "failure_stage": None,
             "durable_ingested_item_count": len(durable_receipts),
             "durable_ingest_receipts": durable_receipts,
+            "reflection_retry_schema": REFLECTION_RETRY_SCHEMA,
+            "reflection_max_retries": MAX_REFLECTION_RETRIES,
+            "reflection_parameters": reflection_parameters,
+            "reflection_parameters_sha256": canonical_sha256(reflection_parameters),
+            "reflection_attempt_count": len(reflection_attempts),
+            "reflection_attempts": reflection_attempts,
             "degraded_reasons": degraded_reasons,
             "raw_reflection_response": reflection,
             "raw_reflection_response_sha256": reflection_sha256,
@@ -225,6 +301,64 @@ def validate_raw_reflection_record(
     if record.get("durable_ingested_item_count") != len(receipts):
         raise ValueError(f"Raw reflection durable item count mismatch for {source.task_id}")
 
+    retry_fields = {
+        "reflection_retry_schema",
+        "reflection_max_retries",
+        "reflection_parameters",
+        "reflection_parameters_sha256",
+        "reflection_attempt_count",
+        "reflection_attempts",
+    }
+    present_retry_fields = retry_fields.intersection(record)
+    attempts: list[dict[str, Any]] | None = None
+    if present_retry_fields:
+        if present_retry_fields != retry_fields:
+            raise ValueError(f"Raw reflection retry accounting is incomplete for {source.task_id}")
+        expected_parameters = {
+            "session_id": run_id,
+            "include_linked_runs": False,
+            "last_n_items": len(parsed.turns),
+        }
+        if record.get("reflection_retry_schema") != REFLECTION_RETRY_SCHEMA:
+            raise ValueError(f"Raw reflection retry schema mismatch for {source.task_id}")
+        if record.get("reflection_max_retries") != MAX_REFLECTION_RETRIES:
+            raise ValueError(f"Raw reflection retry limit mismatch for {source.task_id}")
+        if record.get("reflection_parameters") != expected_parameters:
+            raise ValueError(f"Raw reflection parameters mismatch for {source.task_id}")
+        parameters_sha256 = canonical_sha256(expected_parameters)
+        if record.get("reflection_parameters_sha256") != parameters_sha256:
+            raise ValueError(f"Raw reflection parameter hash mismatch for {source.task_id}")
+        attempts = record.get("reflection_attempts")
+        if not isinstance(attempts, list) or record.get("reflection_attempt_count") != len(attempts):
+            raise ValueError(f"Raw reflection attempt count mismatch for {source.task_id}")
+        if len(attempts) > MAX_REFLECTION_RETRIES + 1:
+            raise ValueError(f"Raw reflection exceeded its retry limit for {source.task_id}")
+        for index, attempt in enumerate(attempts, start=1):
+            if not isinstance(attempt, dict) or attempt.get("attempt_number") != index:
+                raise ValueError(f"Raw reflection attempt order mismatch for {source.task_id}")
+            if attempt.get("parameters_sha256") != parameters_sha256:
+                raise ValueError(f"Raw reflection attempt parameter hash mismatch for {source.task_id}")
+            result = attempt.get("result")
+            if result == "error":
+                if not isinstance(attempt.get("transient"), bool):
+                    raise ValueError(f"Raw reflection attempt transient flag is invalid for {source.task_id}")
+                expected_retry = attempt["transient"] and index <= MAX_REFLECTION_RETRIES
+                if attempt.get("retry_scheduled") is not expected_retry:
+                    raise ValueError(f"Raw reflection attempt retry decision mismatch for {source.task_id}")
+                if not isinstance(attempt.get("error_type"), str) or not isinstance(attempt.get("error"), str):
+                    raise ValueError(f"Raw reflection attempt error is invalid for {source.task_id}")
+                if attempt.get("response_sha256") is not None:
+                    raise ValueError(f"Raw reflection error attempt contains a response for {source.task_id}")
+            elif result in {"ok", "degraded"}:
+                if index != len(attempts) or attempt.get("retry_scheduled") is not False:
+                    raise ValueError(f"Raw reflection terminal attempt position is invalid for {source.task_id}")
+                if attempt.get("transient") is not False or attempt.get("error") is not None:
+                    raise ValueError(f"Raw reflection terminal attempt fields conflict for {source.task_id}")
+                if not isinstance(attempt.get("response_sha256"), str):
+                    raise ValueError(f"Raw reflection terminal attempt hash is invalid for {source.task_id}")
+            else:
+                raise ValueError(f"Raw reflection attempt result is invalid for {source.task_id}")
+
     status = record.get("status")
     if status not in {"ok", "degraded", "failed"}:
         raise ValueError(f"Raw reflection status is invalid for {source.task_id}")
@@ -242,6 +376,11 @@ def validate_raw_reflection_record(
             raise ValueError(f"Raw reflection success/failure fields conflict for {source.task_id}")
         if record.get("error_type") is not None:
             raise ValueError(f"Raw reflection success contains an error type for {source.task_id}")
+        if attempts is not None:
+            if not attempts or attempts[-1]["result"] != status:
+                raise ValueError(f"Raw reflection terminal attempt status mismatch for {source.task_id}")
+            if attempts[-1]["response_sha256"] != response_sha256:
+                raise ValueError(f"Raw reflection terminal attempt response mismatch for {source.task_id}")
     else:
         if record.get("failure_stage") not in {"ingest", "reflect"}:
             raise ValueError(f"Raw reflection failure stage is invalid for {source.task_id}")
@@ -253,3 +392,10 @@ def validate_raw_reflection_record(
             raise ValueError(f"Raw reflection failure contains a reflection response for {source.task_id}")
         if not isinstance(record.get("error_type"), str) or not isinstance(record.get("error"), str):
             raise ValueError(f"Raw reflection failure details are invalid for {source.task_id}")
+        if attempts is not None:
+            if record.get("failure_stage") == "ingest" and attempts:
+                raise ValueError(f"Raw reflection ingest failure has reflection attempts for {source.task_id}")
+            if record.get("failure_stage") == "reflect" and (
+                not attempts or attempts[-1]["result"] != "error" or attempts[-1]["retry_scheduled"] is not False
+            ):
+                raise ValueError(f"Raw reflection failure attempt history is invalid for {source.task_id}")

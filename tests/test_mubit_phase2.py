@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mubit.types import ServerError, TransportError
 
 from mubit_state_bench.artifact import build_frozen_artifact, load_frozen_artifact
 from mubit_state_bench.build_trajectories import build_training_reflections
@@ -61,9 +62,10 @@ class RecordingBuildClient:
 
     def reflect(self, **kwargs):
         self.calls.append(("reflect", kwargs))
-        if isinstance(self.reflection, Exception):
-            raise self.reflection
-        return self.reflection
+        result = self.reflection.pop(0) if isinstance(self.reflection, list) else self.reflection
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class RecordingPublishClient:
@@ -407,9 +409,92 @@ def test_failed_or_degraded_reflection_is_persisted_and_visible(tmp_path):
 
     assert degraded["status"] == "degraded"
     assert degraded["raw_reflection_response"]["lessons"]
+    assert degraded["reflection_attempt_count"] == 1
+    assert degraded["reflection_attempts"][0]["result"] == "degraded"
+    assert len([call for call in degraded_client.calls if call[0] == "reflect"]) == 1
     assert failed["status"] == "failed"
     assert failed["failure_stage"] == "reflect"
     assert failed["raw_reflection_response"] is None
+    assert failed["reflection_attempt_count"] == 1
+    assert failed["reflection_attempts"][0]["transient"] is False
+    assert len([call for call in failed_client.calls if call[0] == "reflect"]) == 1
+
+
+@pytest.mark.parametrize(
+    "transient_error",
+    [
+        ServerError("temporary server failure"),
+        TransportError("UNAVAILABLE", "temporary service failure"),
+    ],
+)
+def test_transient_mubit_reflection_error_retries_same_evidence_and_parameters(
+    tmp_path,
+    transient_error,
+):
+    loader = TrainTrajectoryLoader()
+    source = loader.load("travel", limit=1)[0]
+    response = {"degraded": False, "lessons": [{"content": "recovered"}]}
+    client = RecordingBuildClient([transient_error, response])
+
+    record = MubitTrajectoryLearner(
+        client=client,
+        config=_config(MubitCredentialRole.BUILD),
+        loader=loader,
+    ).learn(source, tmp_path / "retried.json")
+
+    parsed = parse_decision_turns(source)
+    remember_calls = [kwargs for name, kwargs in client.calls if name == "remember"]
+    reflect_calls = [kwargs for name, kwargs in client.calls if name == "reflect"]
+    assert len(remember_calls) == len(parsed.turns)
+    assert reflect_calls == [reflect_calls[0], reflect_calls[0]]
+    assert record["status"] == "ok"
+    assert record["reflection_attempt_count"] == 2
+    assert [attempt["result"] for attempt in record["reflection_attempts"]] == ["error", "ok"]
+    assert record["reflection_attempts"][0]["transient"] is True
+    assert record["reflection_attempts"][0]["retry_scheduled"] is True
+    assert {attempt["parameters_sha256"] for attempt in record["reflection_attempts"]} == {
+        record["reflection_parameters_sha256"]
+    }
+
+
+def test_reflection_stops_after_two_retries_and_preserves_failure(tmp_path):
+    loader = TrainTrajectoryLoader()
+    source = loader.load("travel", limit=1)[0]
+    client = RecordingBuildClient(
+        [ServerError("failure one"), ServerError("failure two"), ServerError("failure three")]
+    )
+
+    record = MubitTrajectoryLearner(
+        client=client,
+        config=_config(MubitCredentialRole.BUILD),
+        loader=loader,
+    ).learn(source, tmp_path / "failed.json")
+
+    assert record["status"] == "failed"
+    assert record["failure_stage"] == "reflect"
+    assert record["error_type"] == "ServerError"
+    assert record["reflection_attempt_count"] == 3
+    assert [attempt["retry_scheduled"] for attempt in record["reflection_attempts"]] == [True, True, False]
+    reflect_calls = [kwargs for name, kwargs in client.calls if name == "reflect"]
+    assert len(reflect_calls) == 3
+    assert reflect_calls == [reflect_calls[0]] * 3
+
+
+def test_non_transient_transport_error_is_not_retried(tmp_path):
+    loader = TrainTrajectoryLoader()
+    source = loader.load("travel", limit=1)[0]
+    client = RecordingBuildClient(TransportError("UNIMPLEMENTED", "not transient"))
+
+    record = MubitTrajectoryLearner(
+        client=client,
+        config=_config(MubitCredentialRole.BUILD),
+        loader=loader,
+    ).learn(source, tmp_path / "failed.json")
+
+    assert record["status"] == "failed"
+    assert record["reflection_attempt_count"] == 1
+    assert record["reflection_attempts"][0]["transient"] is False
+    assert len([call for call in client.calls if call[0] == "reflect"]) == 1
 
 
 def test_artifact_exact_dedupes_retains_provenance_and_hashes_deterministically(tmp_path):
