@@ -1,6 +1,6 @@
 # Mubit phase-two pipeline
 
-Phase 2 creates a one-way, auditable boundary:
+Phase 2 creates a one-way, auditable boundary.. :
 
 ```text
 checked-in train trajectories
