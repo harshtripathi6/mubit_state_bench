@@ -32,6 +32,36 @@ def _credential_env_name(role: MubitCredentialRole, domain: str) -> str:
     return f"MUBIT_STATE_BENCH_{role.value.upper()}_{_domain_env_suffix(domain)}_API_KEY"
 
 
+def _instance_env_name(role: MubitCredentialRole, domain: str) -> str:
+    return f"MUBIT_STATE_BENCH_{role.value.upper()}_{_domain_env_suffix(domain)}_INSTANCE_ID"
+
+
+def _hosted_key_instance_id(api_key: str) -> str | None:
+    """Extract the documented non-secret instance segment from a hosted key."""
+
+    parts = api_key.split("_", 3)
+    if len(parts) == 4 and parts[0] == "mbt" and all(parts[1:]):
+        return parts[1]
+    return None
+
+
+def _resolve_instance_id(role: MubitCredentialRole, domain: str, api_key: str) -> str:
+    instance_name = _instance_env_name(role, domain)
+    explicit = os.getenv(instance_name, "").strip()
+    derived = _hosted_key_instance_id(api_key)
+    if explicit and derived and not hmac.compare_digest(explicit, derived):
+        raise ValueError(
+            f"Mubit instance identity mismatch for {_credential_env_name(role, domain)} and {instance_name}."
+        )
+    instance_id = explicit or derived
+    if not instance_id:
+        raise ValueError(
+            f"Cannot establish the non-secret Mubit instance identity for {_credential_env_name(role, domain)}. "
+            f"Set {instance_name} for non-hosted or legacy key formats."
+        )
+    return instance_id
+
+
 def _first_nonempty(*names: str) -> str:
     for name in names:
         value = os.getenv(name, "").strip()
@@ -49,21 +79,30 @@ def _require_safe_id(value: str, field_name: str) -> str:
 def validate_credential_separation() -> None:
     """Reject any configured role/domain credentials with identical values."""
 
-    configured: list[tuple[str, str]] = []
+    configured: list[tuple[MubitCredentialRole, str, str, str]] = []
     for role in MubitCredentialRole:
         for domain in STATE_BENCH_DOMAINS:
             name = _credential_env_name(role, domain)
             value = os.getenv(name, "").strip()
             if value:
-                configured.append((name, value))
+                configured.append((role, domain, name, value))
 
-    for index, (left_name, left_value) in enumerate(configured):
-        for right_name, right_value in configured[index + 1 :]:
+    for index, (_, _, left_name, left_value) in enumerate(configured):
+        for _, _, right_name, right_value in configured[index + 1 :]:
             if hmac.compare_digest(left_value, right_value):
                 raise ValueError(
                     "Mubit credential isolation violation: "
                     f"{left_name} and {right_name} contain the same key value. "
                     "Use a distinct Mubit instance/key for every role and domain."
+                )
+
+    identities = [(name, _resolve_instance_id(role, domain, value)) for role, domain, name, value in configured]
+    for index, (left_name, left_identity) in enumerate(identities):
+        for right_name, right_identity in identities[index + 1 :]:
+            if hmac.compare_digest(left_identity, right_identity):
+                raise ValueError(
+                    "Mubit instance isolation violation: "
+                    f"{left_name} and {right_name} resolve to the same non-secret instance identity."
                 )
 
 
@@ -84,7 +123,9 @@ class MubitStateBenchConfig:
     experiment_id: str = ""
     arm: str = ""
     artifact_sha256: str = ""
+    lesson_set_sha256: str = ""
     run_number: int | None = None
+    instance_id: str = ""
 
     @classmethod
     def _from_role_env(
@@ -97,6 +138,7 @@ class MubitStateBenchConfig:
         experiment_id: str = "",
         arm: str = "",
         artifact_sha256: str = "",
+        lesson_set_sha256: str = "",
         run_number: int | None = None,
     ) -> "MubitStateBenchConfig":
         suffix = _domain_env_suffix(domain)
@@ -105,6 +147,7 @@ class MubitStateBenchConfig:
         if not api_key:
             raise ValueError(f"Missing {role.value} Mubit credential. Set {credential_name}.")
         validate_credential_separation()
+        instance_id = _resolve_instance_id(role, domain, api_key)
 
         role_suffix = role.value.upper()
         endpoint = (
@@ -136,7 +179,9 @@ class MubitStateBenchConfig:
             experiment_id=experiment_id,
             arm=arm,
             artifact_sha256=artifact_sha256,
+            lesson_set_sha256=lesson_set_sha256,
             run_number=run_number,
+            instance_id=instance_id,
         )
 
     @classmethod
@@ -144,6 +189,9 @@ class MubitStateBenchConfig:
         """Load the evaluation-only configuration used by the benchmark agent."""
 
         domain = runtime_context.domain
+        credential_name = _credential_env_name(MubitCredentialRole.EVAL, domain)
+        if not os.getenv(credential_name, "").strip():
+            raise ValueError(f"Missing eval Mubit credential. Set {credential_name}.")
         namespace = os.getenv("MUBIT_STATE_BENCH_NAMESPACE", "statebench").strip() or "statebench"
         experiment_id = _require_safe_id(
             os.getenv("MUBIT_STATE_BENCH_EXPERIMENT_ID", "").strip(),
@@ -156,6 +204,9 @@ class MubitStateBenchConfig:
         artifact_sha256 = os.getenv("MUBIT_STATE_BENCH_EVAL_ARTIFACT_SHA256", "").strip().lower()
         if not _SHA256.fullmatch(artifact_sha256):
             raise ValueError("MUBIT_STATE_BENCH_EVAL_ARTIFACT_SHA256 must be a 64-character lowercase SHA-256")
+        lesson_set_sha256 = os.getenv("MUBIT_STATE_BENCH_EVAL_LESSON_SET_SHA256", "").strip().lower()
+        if not _SHA256.fullmatch(lesson_set_sha256):
+            raise ValueError("MUBIT_STATE_BENCH_EVAL_LESSON_SET_SHA256 must be a 64-character lowercase SHA-256")
         if runtime_context.run_idx is not None:
             if not isinstance(runtime_context.run_idx, int) or isinstance(runtime_context.run_idx, bool):
                 raise ValueError("STATE-Bench runtime run_idx must be an integer >= 1")
@@ -179,6 +230,7 @@ class MubitStateBenchConfig:
             experiment_id=experiment_id,
             arm=arm,
             artifact_sha256=artifact_sha256,
+            lesson_set_sha256=lesson_set_sha256,
             run_number=run_number,
         )
 
@@ -212,10 +264,13 @@ class MubitStateBenchConfig:
         domain: str,
         experiment_id: str,
         artifact_sha256: str,
+        lesson_set_sha256: str,
     ) -> "MubitStateBenchConfig":
         experiment_id = _require_safe_id(experiment_id, "experiment_id")
         if not _SHA256.fullmatch(artifact_sha256):
             raise ValueError("artifact_sha256 must be a 64-character lowercase SHA-256")
+        if not _SHA256.fullmatch(lesson_set_sha256):
+            raise ValueError("lesson_set_sha256 must be a 64-character lowercase SHA-256")
         namespace = os.getenv("MUBIT_STATE_BENCH_NAMESPACE", "statebench").strip() or "statebench"
         return cls._from_role_env(
             domain=domain,
@@ -225,14 +280,18 @@ class MubitStateBenchConfig:
             experiment_id=experiment_id,
             arm="publication",
             artifact_sha256=artifact_sha256,
+            lesson_set_sha256=lesson_set_sha256,
         )
 
 
-def redact_configured_secrets(message: str) -> str:
-    redacted = message
+def redact_configured_secrets(message: str, extra_secrets: tuple[str, ...] = ()) -> str:
+    secrets: set[str] = {value for value in extra_secrets if value}
     for role in MubitCredentialRole:
         for domain in STATE_BENCH_DOMAINS:
             value = os.getenv(_credential_env_name(role, domain), "").strip()
             if value:
-                redacted = redacted.replace(value, "[redacted]")
+                secrets.add(value)
+    redacted = message
+    for value in sorted(secrets, key=len, reverse=True):
+        redacted = redacted.replace(value, "[redacted]")
     return redacted

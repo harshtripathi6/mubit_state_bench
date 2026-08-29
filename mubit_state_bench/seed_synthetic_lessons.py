@@ -8,6 +8,7 @@ import json
 from dotenv import load_dotenv
 
 from mubit_state_bench.config import MubitStateBenchConfig
+from mubit_state_bench.durability import MubitDurableWriter
 from mubit_state_bench.synthetic_lessons import TRAVEL_SYNTHETIC_LESSONS
 
 
@@ -21,9 +22,12 @@ def seed_travel_lessons() -> list[dict[str, object]]:
         run_id=config.run_id,
         api_key=config.api_key,
     )
+    durable_writer = MubitDurableWriter(client)
     results: list[dict[str, object]] = []
     for lesson in TRAVEL_SYNTHETIC_LESSONS:
-        response = client.remember(
+        receipt = durable_writer.remember_durable(
+            expected_item_id=lesson.item_id,
+            expected_memory_type="lesson",
             session_id=config.run_id,
             agent_id="statebench-phase1-seeder",
             item_id=lesson.item_id,
@@ -42,13 +46,12 @@ def seed_travel_lessons() -> list[dict[str, object]]:
                 "domain": "travel",
                 "synthetic": True,
             },
-            wait=True,
         )
         results.append(
             {
                 "item_id": lesson.item_id,
                 "content": lesson.content,
-                "accepted": bool(response),
+                "durable_receipt": receipt.to_dict(),
             }
         )
     return results

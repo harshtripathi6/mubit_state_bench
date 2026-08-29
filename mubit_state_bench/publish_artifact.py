@@ -30,6 +30,7 @@ def main() -> None:
         args.domain,
         args.experiment_id,
         artifact["artifact_sha256"],
+        artifact["lesson_set_sha256"],
     )
 
     from mubit import Client

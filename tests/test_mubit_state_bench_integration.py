@@ -77,6 +77,7 @@ def _config(telemetry_path: Path) -> MubitStateBenchConfig:
         experiment_id="phase2-test",
         arm="mubit",
         artifact_sha256="a" * 64,
+        lesson_set_sha256="b" * 64,
         run_number=2,
     )
 
@@ -155,7 +156,28 @@ def test_retrieval_is_one_read_only_direct_bypass_call_and_caps_top_k(tmp_path):
     assert events[0]["experiment_id"] == "phase2-test"
     assert events[0]["arm"] == "mubit"
     assert events[0]["artifact_sha256"] == "a" * 64
+    assert events[0]["lesson_set_sha256"] == "b" * 64
     assert events[0]["run_number"] == 2
+
+
+def test_retrieval_telemetry_redacts_configured_api_key_from_exceptions(tmp_path):
+    telemetry_path = tmp_path / "retrieval.jsonl"
+    config = _config(telemetry_path)
+    client = MagicMock()
+    client.recall.side_effect = RuntimeError(f"request rejected for credential {config.api_key}")
+    store = MubitReadOnlyStore(
+        client=client,
+        config=config,
+        runtime_context=_runtime_context(),
+        telemetry=JsonlTelemetrySink(telemetry_path),
+    )
+
+    with pytest.raises(RuntimeError):
+        store.retrieve("cancel safely", top_k=3)
+
+    telemetry = telemetry_path.read_text()
+    assert config.api_key not in telemetry
+    assert "[redacted]" in telemetry
 
 
 def test_real_state_bench_task_invokes_mubit_retrieval_without_state_mutation():
@@ -250,9 +272,26 @@ def test_config_requires_a_domain_specific_mubit_instance(monkeypatch):
 
 
 def test_seed_script_writes_exactly_five_global_lessons(monkeypatch):
-    monkeypatch.setenv("MUBIT_STATE_BENCH_SMOKE_TRAVEL_API_KEY", "isolated-travel-smoke-key")
+    monkeypatch.setenv("MUBIT_STATE_BENCH_SMOKE_TRAVEL_API_KEY", "mbt_smokeinstance_key_secret")
     client = MagicMock()
-    client.remember.side_effect = [{"job_id": f"job-{index}"} for index in range(5)]
+    client.remember.side_effect = [
+        {"accepted": True, "job_id": f"job-{index}", "status": "pending"} for index in range(5)
+    ]
+    client.advanced.get_ingest_job.side_effect = [
+        {
+            "job_id": f"job-{index}",
+            "run_id": "statebench:travel:smoke:phase1-synthetic",
+            "status": "completed",
+            "done": True,
+            "traces": [
+                {
+                    "item_id": lesson.item_id,
+                    "writes": [{"memory_type": "lesson", "record_id": f"record-{index}", "success": True}],
+                }
+            ],
+        }
+        for index, lesson in enumerate(TRAVEL_SYNTHETIC_LESSONS)
+    ]
 
     with patch("mubit.Client", return_value=client):
         results = seed_travel_lessons()
@@ -267,6 +306,6 @@ def test_seed_script_writes_exactly_five_global_lessons(monkeypatch):
         assert call.kwargs["session_id"] == "statebench:travel:smoke:phase1-synthetic"
         assert call.kwargs["intent"] == "lesson"
         assert call.kwargs["lesson_scope"] == "global"
-        assert call.kwargs["wait"] is True
+        assert call.kwargs["wait"] is False
         assert call.kwargs["metadata"]["domain"] == "travel"
         assert call.kwargs["metadata"]["synthetic"] is True

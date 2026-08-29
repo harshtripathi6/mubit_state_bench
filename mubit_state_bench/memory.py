@@ -7,7 +7,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from mubit_state_bench.config import MubitStateBenchConfig
+from mubit_state_bench.config import MubitStateBenchConfig, redact_configured_secrets
 from mubit_state_bench.telemetry import JsonlTelemetrySink
 from state_bench.agents.base import AgentRuntimeContext
 
@@ -62,6 +62,7 @@ class MubitReadOnlyStore:
             "experiment_id": self._config.experiment_id,
             "arm": self._config.arm,
             "artifact_sha256": self._config.artifact_sha256,
+            "lesson_set_sha256": self._config.lesson_set_sha256,
             "run_number": self._config.run_number,
             "query": query,
             "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
@@ -102,7 +103,7 @@ class MubitReadOnlyStore:
                     "status": "error",
                     "latency_ms": round((time.perf_counter() - started) * 1000, 3),
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": redact_configured_secrets(str(exc), (self._config.api_key,)),
                 }
             )
             raise
