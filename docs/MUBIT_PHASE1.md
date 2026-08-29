@@ -12,14 +12,13 @@ not ingest, reflect on, or learn from training trajectories.
 Use one Mubit instance/API key per STATE-Bench domain:
 
 ```dotenv
-MUBIT_STATE_BENCH_TRAVEL_API_KEY="mbt_..."
-MUBIT_STATE_BENCH_CUSTOMER_SUPPORT_API_KEY="mbt_..."
-MUBIT_STATE_BENCH_SHOPPING_ASSISTANT_API_KEY="mbt_..."
+MUBIT_STATE_BENCH_SMOKE_TRAVEL_API_KEY="mbt_..."
+MUBIT_STATE_BENCH_SMOKE_CUSTOMER_SUPPORT_API_KEY="mbt_..."
+MUBIT_STATE_BENCH_SMOKE_SHOPPING_ASSISTANT_API_KEY="mbt_..."
 ```
 
-There is no shared-key fallback. Requiring the domain-specific variable makes
-it harder to accidentally point two evaluation domains at the same instance,
-and the integration also intentionally ignores a generic `MUBIT_API_KEY`.
+There is no shared-key fallback. The synthetic seeder accepts only a SMOKE
+credential; Phase-2 BUILD and EVAL credentials cannot be used for seeding.
 
 Every retrieval is one Mubit `recall` request with:
 
@@ -38,15 +37,18 @@ trajectory and environment state.
 ```bash
 uv sync --group dev
 cp .env.example .env
-# Add the isolated travel Mubit API key to .env.
+# Add the isolated travel SMOKE Mubit API key to .env.
 uv run mubit-state-bench-seed --domain travel
 ```
 
-The seed command writes exactly five fixed synthetic travel lessons. Each write
+The seed command writes exactly five fixed synthetic travel lessons into a
+disposable SMOKE instance. Each write
 uses `intent="lesson"`, `lesson_scope="global"`, a stable upsert key, and a
 stable idempotency key. This explicit global scope is intentional: it makes the
-lessons available to frozen evaluation runs without waiting for gradual scope
-promotion.
+lessons recallable across runs inside that SMOKE instance without waiting for
+gradual scope promotion. Phase 2 never points the official evaluator at this
+synthetic instance; it publishes only a frozen train-derived artifact into a
+separate EVAL instance.
 
 ## Deterministic task-level proof
 
@@ -73,7 +75,12 @@ and built-in agent loop are used.
 
 ## One live task
 
-After seeding and configuring the STATE-Bench model/simulator credentials, run:
+After publishing a frozen artifact and configuring the STATE-Bench
+model/simulator credentials, run:
+
+Phase 2 requires a separate EVAL key plus experiment, artifact, arm, and run
+identity. See [Mubit phase-two pipeline](MUBIT_PHASE2.md) before using the live
+command below.
 
 ```bash
 uv run python -m state_bench.scripts.run_task \

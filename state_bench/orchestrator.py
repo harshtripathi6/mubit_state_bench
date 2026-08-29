@@ -135,6 +135,8 @@ def run_task(
     agent_class: type[BaseAgent] | None = None,
     retrieve_learnings_top_k: int = 3,
     agent_reasoning_effort: str | None = None,
+    runtime_output_dir: str | None = None,
+    runtime_run_idx: int | None = None,
 ) -> Trajectory:
     """Run a single task and return the trajectory.
 
@@ -174,6 +176,8 @@ def run_task(
             user_id=user_id,
             domain=domain.name,
             now=now,
+            output_dir=runtime_output_dir,
+            run_idx=runtime_run_idx,
             task_summary=task.task_summary,
             state_requirements=task.state_requirements,
             task_requirements=task.task_requirements,

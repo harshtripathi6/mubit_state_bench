@@ -93,6 +93,7 @@ def _build_agent_model_metadata(args: argparse.Namespace) -> dict[str, str | Non
 
 def _run_single(
     task_file: Path,
+    run_idx: int,
     client: BaseLLMClient | None,
     simulator_client: LLMClient | PooledLLMClient | None,
     output_dir: Path,
@@ -136,6 +137,8 @@ def _run_single(
                 agent_class=agent_class,
                 retrieve_learnings_top_k=retrieve_learnings_top_k,
                 agent_reasoning_effort=agent_reasoning_effort,
+                runtime_output_dir=str(output_dir),
+                runtime_run_idx=run_idx,
             )
 
             out_path = output_dir / f"{task.task_id}.json"
@@ -385,6 +388,7 @@ def main() -> None:
             executor.submit(
                 _run_single,
                 tf,
+                run_idx,
                 client,
                 user_sim_client,
                 run_dirs[run_idx],

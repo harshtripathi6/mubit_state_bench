@@ -40,6 +40,8 @@ Start with the track that matches what you want to evaluate. Each track guide li
 
 This fork's initial Mubit adapter, isolated synthetic seeder, and task-level
 smoke proof are documented in **[Mubit phase-one integration](docs/MUBIT_PHASE1.md)**.
+The contamination-resistant offline learning, freezing, and EVAL publication
+pipeline is documented in **[Mubit phase-two pipeline](docs/MUBIT_PHASE2.md)**.
 
 The **Main Track** is the default benchmark path. The **Agent Learning Track** uses the same simulator, domain tools, judges, and metrics, but adds train trajectories and a retrieval hook for reusable learnings such as memories, skills, or prompt optimizations.
 

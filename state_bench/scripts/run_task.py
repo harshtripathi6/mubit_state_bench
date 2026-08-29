@@ -143,6 +143,8 @@ def _run_single_task(
         agent_class=agent_class,
         retrieve_learnings_top_k=retrieve_learnings_top_k,
         agent_reasoning_effort=agent_reasoning_effort,
+        runtime_output_dir=str(output_dir),
+        runtime_run_idx=run_idx,
     )
 
     tool_calls = []

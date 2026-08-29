@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mubit_state_bench.agent import MubitStateBenchAgent
-from mubit_state_bench.config import MubitStateBenchConfig
+from mubit_state_bench.config import MubitCredentialRole, MubitStateBenchConfig
 from mubit_state_bench.memory import MubitReadOnlyStore
 from mubit_state_bench.seed_synthetic_lessons import seed_travel_lessons
 from mubit_state_bench.synthetic_lessons import TRAVEL_SYNTHETIC_LESSONS
@@ -73,6 +73,11 @@ def _config(telemetry_path: Path) -> MubitStateBenchConfig:
         namespace="statebench",
         run_id=f"statebench:{REAL_DOMAIN_NAME}:eval:{REAL_TASK_ID}",
         telemetry_path=telemetry_path,
+        role=MubitCredentialRole.EVAL,
+        experiment_id="phase2-test",
+        arm="mubit",
+        artifact_sha256="a" * 64,
+        run_number=2,
     )
 
 
@@ -147,6 +152,10 @@ def test_retrieval_is_one_read_only_direct_bypass_call_and_caps_top_k(tmp_path):
     assert events[0]["returned_count"] == 3
     assert events[0]["request"]["mode"] == "direct_bypass"
     assert events[0]["request"]["evidence_only"] is True
+    assert events[0]["experiment_id"] == "phase2-test"
+    assert events[0]["arm"] == "mubit"
+    assert events[0]["artifact_sha256"] == "a" * 64
+    assert events[0]["run_number"] == 2
 
 
 def test_real_state_bench_task_invokes_mubit_retrieval_without_state_mutation():
@@ -229,16 +238,19 @@ def test_root_agent_loader_discovers_mubit_subclass():
 
 
 def test_config_requires_a_domain_specific_mubit_instance(monkeypatch):
-    monkeypatch.delenv("MUBIT_STATE_BENCH_TRAVEL_API_KEY", raising=False)
+    monkeypatch.delenv("MUBIT_STATE_BENCH_EVAL_TRAVEL_API_KEY", raising=False)
     monkeypatch.setenv("MUBIT_STATE_BENCH_API_KEY", "shared-key-must-not-be-used")
     monkeypatch.setenv("MUBIT_API_KEY", "generic-key-must-not-be-used")
+    monkeypatch.setenv("MUBIT_STATE_BENCH_EXPERIMENT_ID", "phase2-test")
+    monkeypatch.setenv("MUBIT_STATE_BENCH_EVAL_ARTIFACT_SHA256", "a" * 64)
+    monkeypatch.setenv("MUBIT_STATE_BENCH_RUN_NUMBER", "1")
 
-    with pytest.raises(ValueError, match="MUBIT_STATE_BENCH_TRAVEL_API_KEY"):
+    with pytest.raises(ValueError, match="MUBIT_STATE_BENCH_EVAL_TRAVEL_API_KEY"):
         MubitStateBenchConfig.from_env(_runtime_context())
 
 
 def test_seed_script_writes_exactly_five_global_lessons(monkeypatch):
-    monkeypatch.setenv("MUBIT_STATE_BENCH_TRAVEL_API_KEY", "isolated-travel-key")
+    monkeypatch.setenv("MUBIT_STATE_BENCH_SMOKE_TRAVEL_API_KEY", "isolated-travel-smoke-key")
     client = MagicMock()
     client.remember.side_effect = [{"job_id": f"job-{index}"} for index in range(5)]
 
@@ -252,7 +264,7 @@ def test_seed_script_writes_exactly_five_global_lessons(monkeypatch):
         lesson.item_id for lesson in TRAVEL_SYNTHETIC_LESSONS
     }
     for call in client.remember.call_args_list:
-        assert call.kwargs["session_id"] == "statebench:travel:seed:phase1-synthetic"
+        assert call.kwargs["session_id"] == "statebench:travel:smoke:phase1-synthetic"
         assert call.kwargs["intent"] == "lesson"
         assert call.kwargs["lesson_scope"] == "global"
         assert call.kwargs["wait"] is True
