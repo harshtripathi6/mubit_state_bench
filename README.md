@@ -38,6 +38,9 @@ Start with the track that matches what you want to evaluate. Each track guide li
 | Evaluate an agent or model directly on the provided enterprise benchmark tasks | **[Main Track](docs/RUN_BENCHMARK.md)** |
 | Evaluate agentic memory, skills, or prompt optimization | **[Agent Learning Track](docs/AGENT_LEARNING_TRACK.md)** |
 
+This fork's initial Mubit adapter, isolated synthetic seeder, and task-level
+smoke proof are documented in **[Mubit phase-one integration](docs/MUBIT_PHASE1.md)**.
+
 The **Main Track** is the default benchmark path. The **Agent Learning Track** uses the same simulator, domain tools, judges, and metrics, but adds train trajectories and a retrieval hook for reusable learnings such as memories, skills, or prompt optimizations.
 
 For run commands and flag selection, start with the relevant track guide. The shared [`run_batch` reference](docs/eval/run-batch.md) lists which flags are required for the built-in agent, custom clients, and learning-track runs.

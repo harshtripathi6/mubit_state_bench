@@ -9,6 +9,7 @@ license = { text = "MIT" }
 dependencies = [
     "openai>=1.0.0",
     "azure-identity>=1.15.0",
+    "mubit-sdk==0.13.2",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
     "tiktoken>=0.12.0",
@@ -23,7 +24,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["state_bench"]
+packages = ["state_bench", "mubit_state_bench"]
 include = [
     "state_bench/configs/**/*.json",
     "state_bench/configs/**/*.yaml",
@@ -31,6 +32,9 @@ include = [
     "state_bench/domains/**/*.md",
 ]
 force-include = { "datasets/train_task_trajectories" = "datasets/train_task_trajectories" }
+
+[project.scripts]
+mubit-state-bench-seed = "mubit_state_bench.seed_synthetic_lessons:main"
 
 [tool.ruff]
 line-length = 120
