@@ -643,14 +643,12 @@ def _resolve_deployments(
     primary endpoint variable.
     """
     if provider == "openai":
-        model = (
-            (deployments[0] if deployments else None)
-            or os.environ.get("STATE_BENCH_AGENT_MODEL")
-            or os.environ.get("OPENAI_MODEL")
-        )
-        resolved = [model] if model else []
+        resolved = deployments or _parse_env_list(deployments_var)
         if not resolved:
-            raise ValueError("No OpenAI model configured. Set STATE_BENCH_AGENT_MODEL.")
+            model = os.environ.get("STATE_BENCH_AGENT_MODEL") or os.environ.get("OPENAI_MODEL")
+            resolved = [model] if model else []
+        if not resolved:
+            raise ValueError(f"No OpenAI model configured. Set {deployments_var}.")
         return [("", model) for model in resolved]
 
     if deployments is None:
@@ -868,6 +866,7 @@ def build_user_sim_client() -> LLMClient | PooledLLMClient:
     return build_llm_client(
         endpoint_var="STATE_BENCH_EVAL_ENDPOINT",
         deployments_var="STATE_BENCH_EVAL_DEPLOYMENTS",
+        provider=os.environ.get("STATE_BENCH_EVAL_PROVIDER", "azure_openai"),
         api_key_var="STATE_BENCH_EVAL_API_KEY",
     )
 
@@ -877,5 +876,6 @@ def build_locked_judge_client() -> LLMClient | PooledLLMClient:
     return build_llm_client(
         endpoint_var="STATE_BENCH_EVAL_ENDPOINT",
         deployments_var="STATE_BENCH_EVAL_DEPLOYMENTS",
+        provider=os.environ.get("STATE_BENCH_EVAL_PROVIDER", "azure_openai"),
         api_key_var="STATE_BENCH_EVAL_API_KEY",
     )

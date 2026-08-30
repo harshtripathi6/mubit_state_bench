@@ -57,6 +57,7 @@ def _clear_numbered_azure_env(monkeypatch):
         "STATE_BENCH_AGENT_DEPLOYMENTS",
         "STATE_BENCH_EVAL_ENDPOINT",
         "STATE_BENCH_EVAL_DEPLOYMENTS",
+        "STATE_BENCH_EVAL_PROVIDER",
     ):
         monkeypatch.delenv(name, raising=False)
     for index in range(1, 11):
@@ -128,6 +129,37 @@ def test_locked_eval_clients_share_state_bench_eval_config(monkeypatch):
     assert user_sim_client.deployments == ["gpt-5.1-eval"]
     assert judge_client.deployments == ["gpt-5.1-eval"]
     assert openai_client.call_count == 2
+    for call in openai_client.call_args_list:
+        assert call.kwargs == {
+            "base_url": "https://eval.openai.azure.com/openai/v1/",
+            "api_key": "test-key",
+        }
+
+
+def test_locked_eval_clients_support_openai_without_azure_endpoint(monkeypatch):
+    _clear_numbered_azure_env(monkeypatch)
+    monkeypatch.setenv("STATE_BENCH_EVAL_PROVIDER", "openai")
+    monkeypatch.setenv("STATE_BENCH_EVAL_DEPLOYMENTS", "gpt-5.4")
+    monkeypatch.setenv("STATE_BENCH_EVAL_API_KEY", "eval-openai-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong-fallback-key")
+
+    with (
+        patch("state_bench.client.OpenAI") as openai_client,
+        patch("state_bench.client._build_azure_openai_client") as azure_client,
+    ):
+        user_sim_client = build_user_sim_client()
+        judge_client = build_locked_judge_client()
+
+    azure_client.assert_not_called()
+    assert isinstance(user_sim_client, LLMClient)
+    assert isinstance(judge_client, LLMClient)
+    assert user_sim_client.endpoint == ""
+    assert judge_client.endpoint == ""
+    assert user_sim_client.deployments == ["gpt-5.4"]
+    assert judge_client.deployments == ["gpt-5.4"]
+    assert openai_client.call_count == 2
+    for call in openai_client.call_args_list:
+        assert call.kwargs == {"api_key": "eval-openai-key"}
 
 
 def test_openai_client_uses_openai_api_key_and_model(monkeypatch):
