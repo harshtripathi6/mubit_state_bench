@@ -50,12 +50,12 @@ class MubitEvalAuditor:
         self._clock = clock
         self._sleeper = sleeper
 
-    def _activity_page(self, page_token: str = "") -> dict[str, Any]:
+    def _activity_page(self, page_token: str = "", *, exclude_derived: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "run_id": "",
             "sort": "asc",
             "limit": 500,
-            "exclude_derived": False,
+            "exclude_derived": exclude_derived,
             "projection": "full",
         }
         if page_token:
@@ -72,13 +72,13 @@ class MubitEvalAuditor:
             raise EvalAuditError("Mubit ListActivity returned an invalid response")
         return response
 
-    def list_all_activity(self) -> list[dict[str, Any]]:
+    def list_all_activity(self, *, exclude_derived: bool = False) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         page_token = ""
         seen_tokens: set[str] = set()
         total_visible: int | None = None
         while True:
-            response = self._activity_page(page_token)
+            response = self._activity_page(page_token, exclude_derived=exclude_derived)
             response_total = response.get("total_visible")
             if response_total is not None:
                 try:
@@ -112,7 +112,7 @@ class MubitEvalAuditor:
         return lessons
 
     def assert_clean(self) -> dict[str, Any]:
-        activity = self.list_all_activity()
+        activity = self.list_all_activity(exclude_derived=False)
         lessons = self.list_global_lessons()
         if activity or lessons:
             raise EvalAuditError(
@@ -125,34 +125,63 @@ class MubitEvalAuditor:
         deadline = self._clock() + self._timeout_seconds
         last_summary = "no audit completed"
         while True:
-            activity = self.list_all_activity()
+            activity = self.list_all_activity(exclude_derived=False)
+            non_derived_activity = self.list_all_activity(exclude_derived=True)
             lessons = self.list_global_lessons()
-            activity_types = [str(entry.get("entry_type", "")) for entry in activity]
-            activity_contents = [entry.get("content") for entry in activity]
+
+            def summarize_activity(entries: list[dict[str, Any]]) -> dict[str, Any]:
+                contents = [entry.get("content") for entry in entries]
+                valid_content = all(isinstance(value, str) for value in contents)
+                hashes = [sha256_text(value) for value in contents if isinstance(value, str)]
+                matching_count = sum(value in expected_content_sha256s for value in hashes)
+                exact_content_set = (
+                    valid_content
+                    and len(hashes) == len(expected_content_sha256s)
+                    and set(hashes) == expected_content_sha256s
+                )
+                all_lesson_entries = all(str(entry.get("entry_type", "")) == "lesson" for entry in entries)
+                return {
+                    "count": len(entries),
+                    "matching_frozen_content_count": matching_count,
+                    "extra_record_count": len(entries) - matching_count,
+                    "exact_content_set": exact_content_set,
+                    "all_entries_are_lessons": all_lesson_entries,
+                }
+
+            total_activity = summarize_activity(activity)
+            non_derived = summarize_activity(non_derived_activity)
             lesson_contents = [lesson.get("content") for lesson in lessons]
-            valid_content = all(isinstance(value, str) for value in activity_contents + lesson_contents)
-            activity_hashes = [sha256_text(value) for value in activity_contents if isinstance(value, str)]
+            valid_lesson_content = all(isinstance(value, str) for value in lesson_contents)
             lesson_hashes = [sha256_text(value) for value in lesson_contents if isinstance(value, str)]
-            exact_activity = (
-                valid_content
-                and all(entry_type == "lesson" for entry_type in activity_types)
-                and len(activity_hashes) == len(expected_content_sha256s)
-                and set(activity_hashes) == expected_content_sha256s
-            )
             exact_lessons = (
-                valid_content
+                valid_lesson_content
                 and len(lesson_hashes) == len(expected_content_sha256s)
                 and set(lesson_hashes) == expected_content_sha256s
             )
-            if exact_activity and exact_lessons:
+            if exact_lessons:
+                if non_derived["exact_content_set"] and not non_derived["all_entries_are_lessons"]:
+                    raise EvalAuditError(
+                        "Non-derived activity exactly matched the frozen content set but included non-lesson entries"
+                    )
                 return {
                     "visible_activity_count": len(activity),
+                    "non_derived_activity_count": len(non_derived_activity),
+                    "activity_matching_frozen_content_count": total_activity["matching_frozen_content_count"],
+                    "activity_extra_record_count": total_activity["extra_record_count"],
+                    "non_derived_activity_matching_frozen_content_count": non_derived[
+                        "matching_frozen_content_count"
+                    ],
+                    "non_derived_activity_extra_record_count": non_derived["extra_record_count"],
+                    "non_derived_activity_exact_lesson_set": (
+                        non_derived["exact_content_set"] and non_derived["all_entries_are_lessons"]
+                    ),
                     "global_lesson_count": len(lessons),
+                    "authoritative_global_lesson_set_exact": True,
                     "content_sha256s": sorted(expected_content_sha256s),
                 }
             last_summary = (
-                f"activity_count={len(activity)}, lesson_count={len(lessons)}, "
-                f"activity_types={sorted(set(activity_types))}"
+                f"lesson_count={len(lessons)}, expected_lesson_count={len(expected_content_sha256s)}, "
+                f"activity_count={len(activity)}, non_derived_activity_count={len(non_derived_activity)}"
             )
             if self._clock() >= deadline:
                 raise EvalAuditError(f"Published EVAL lesson set did not converge exactly: {last_summary}")

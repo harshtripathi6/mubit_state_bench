@@ -21,6 +21,7 @@ from mubit_state_bench.io_utils import canonical_sha256, write_json_atomic
 from mubit_state_bench.learning import RAW_REFLECTION_SCHEMA, MubitTrajectoryLearner
 from mubit_state_bench.phase2_paths import Phase2Paths
 from mubit_state_bench.publication import FrozenArtifactPublisher
+from mubit_state_bench.recovery import recover_publication_manifest
 from mubit_state_bench.remote_audit import EvalAuditError, MubitEvalAuditor
 from mubit_state_bench.trajectory import (
     DECISION_TURN_SCHEMA,
@@ -914,11 +915,19 @@ def test_lesson_set_hash_is_independent_of_experiment_and_provenance(tmp_path):
 
 
 class AuditClient:
-    def __init__(self, activity: list[dict], lessons: list[dict]):
+    def __init__(
+        self,
+        activity: list[dict],
+        lessons: list[dict],
+        *,
+        non_derived_activity: list[dict] | None = None,
+    ):
+        def list_activity(**kwargs):
+            entries = non_derived_activity if kwargs.get("exclude_derived") and non_derived_activity is not None else activity
+            return {"entries": entries, "next_page_token": "", "total_visible": len(entries)}
+
         self.advanced = SimpleNamespace(
-            list_activity=MagicMock(
-                return_value={"entries": activity, "next_page_token": "", "total_visible": len(activity)}
-            )
+            list_activity=MagicMock(side_effect=list_activity)
         )
         self.lessons = MagicMock(return_value={"lessons": lessons})
 
@@ -947,22 +956,33 @@ def test_remote_activity_audit_uses_sdk_0132_transport_fallback():
     assert operation["http"] == {"method": "POST", "path": "/v2/control/activity"}
     assert payload["run_id"] == ""
     assert payload["projection"] == "full"
+    assert payload["exclude_derived"] is False
 
 
-def test_remote_eval_post_audit_requires_exact_activity_and_lesson_content_set():
+def test_remote_eval_post_audit_uses_exact_global_lessons_as_authoritative_set():
     content = "A frozen procedural lesson."
     expected = {__import__("hashlib").sha256(content.encode()).hexdigest()}
     exact_client = AuditClient(
-        [{"entry_type": "lesson", "content": content}],
+        [
+            {"entry_type": "lesson", "content": content},
+            {"entry_type": "lesson", "content": "server-generated activity history"},
+        ],
         [{"content": content}],
     )
     audit = MubitEvalAuditor(exact_client).await_exact_lesson_set(expected)
     assert audit["content_sha256s"] == sorted(expected)
+    assert audit["authoritative_global_lesson_set_exact"] is True
+    assert audit["visible_activity_count"] == 2
+    assert audit["activity_matching_frozen_content_count"] == 1
+    assert audit["activity_extra_record_count"] == 1
+    assert audit["non_derived_activity_count"] == 2
+    assert audit["non_derived_activity_extra_record_count"] == 1
+    assert audit["non_derived_activity_exact_lesson_set"] is False
 
     times = iter([0.0, 2.0])
     mismatched_client = AuditClient(
-        [{"entry_type": "lesson", "content": "unexpected"}],
-        [{"content": content}],
+        [{"entry_type": "lesson", "content": content}],
+        [{"content": "unexpected"}],
     )
     with pytest.raises(EvalAuditError, match="did not converge exactly"):
         MubitEvalAuditor(
@@ -972,6 +992,65 @@ def test_remote_eval_post_audit_requires_exact_activity_and_lesson_content_set()
             clock=lambda: next(times),
             sleeper=lambda _: None,
         ).await_exact_lesson_set(expected)
+
+
+def test_remote_eval_post_audit_validates_exact_non_derived_activity_when_available():
+    content = "A frozen procedural lesson."
+    expected = {__import__("hashlib").sha256(content.encode()).hexdigest()}
+    client = AuditClient(
+        [
+            {"entry_type": "lesson", "content": content},
+            {"entry_type": "lesson", "content": "derived history"},
+        ],
+        [{"content": content}],
+        non_derived_activity=[{"entry_type": "lesson", "content": content}],
+    )
+
+    audit = MubitEvalAuditor(client).await_exact_lesson_set(expected)
+
+    assert audit["visible_activity_count"] == 2
+    assert audit["activity_extra_record_count"] == 1
+    assert audit["non_derived_activity_count"] == 1
+    assert audit["non_derived_activity_extra_record_count"] == 0
+    assert audit["non_derived_activity_exact_lesson_set"] is True
+    assert [call.kwargs["exclude_derived"] for call in client.advanced.list_activity.call_args_list] == [False, True]
+
+
+def test_recovery_manifest_uses_read_only_exact_set_verification(tmp_path):
+    artifact, artifact_path, _ = _build_test_artifact(tmp_path)
+    content = artifact["lessons"][0]["content"]
+    client = AuditClient(
+        [
+            {"entry_type": "lesson", "content": content},
+            {"entry_type": "lesson", "content": "server-generated activity history"},
+        ],
+        [{"content": content}],
+    )
+    client.remember = MagicMock(side_effect=AssertionError("recovery must never write"))
+    config = _config(
+        MubitCredentialRole.EVAL,
+        artifact_sha256=artifact["artifact_sha256"],
+        lesson_set_sha256=artifact["lesson_set_sha256"],
+    )
+    publication_path = tmp_path / "publication.json"
+
+    manifest = recover_publication_manifest(
+        artifact_path=artifact_path,
+        publication_path=publication_path,
+        config=config,
+        auditor=MubitEvalAuditor(client),
+        original_clean_preflight={"visible_activity_count": 0, "global_lesson_count": 0},
+        original_durable_write_count=artifact["lesson_count"],
+    )
+
+    client.remember.assert_not_called()
+    assert publication_path.exists()
+    assert manifest["schema_version"] == "mubit_artifact_publication_recovery_v1"
+    assert manifest["publication_status"] == "recovered_after_strict_activity_audit_mismatch"
+    assert manifest["recovery_remote_access"] == "read_only"
+    assert manifest["published_count"] == artifact["lesson_count"]
+    assert manifest["remote_post_publication_audit"]["authoritative_global_lesson_set_exact"] is True
+    assert manifest["remote_post_publication_audit"]["activity_extra_record_count"] == 1
 
 
 def test_publication_does_not_write_manifest_when_post_audit_fails(tmp_path):

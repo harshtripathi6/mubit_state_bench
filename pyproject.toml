@@ -38,6 +38,7 @@ mubit-state-bench-seed = "mubit_state_bench.seed_synthetic_lessons:main"
 mubit-state-bench-build = "mubit_state_bench.build_trajectories:main"
 mubit-state-bench-freeze = "mubit_state_bench.freeze_lessons:main"
 mubit-state-bench-publish = "mubit_state_bench.publish_artifact:main"
+mubit-state-bench-recover-publication = "mubit_state_bench.recover_publication:main"
 
 [tool.ruff]
 line-length = 120
